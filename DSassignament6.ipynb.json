@@ -1,0 +1,1048 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Assignment 6\n",
+    "\n",
+    "[3 points] Delelop language model, which generates texts from wikipedia.   \n",
+    "Use WikiText-2 dataset, also available in `torchtext.datasets`.  \n",
+    "Use `sentencepiece` or `tokenizers` library for text tokenization. Pay attention to vocab size, probably subword tokens are better.    \n",
+    "Your model should be autogressive RNN.  \n",
+    "[1 point] Plot train and validation loss depending on the number of iterations of gradient decent.  \n",
+    "[1 point] Try to use together (`sentencepiece` or `tokenizers`), `torchtext.datasets`, and `torchtext.data.BPTTIterator`  \n",
+    "\n",
+    "<img src=\"https://github.com/leramorozova/compling_and_infotech/blob/master/assignment_6/images/lm.jpg?raw=1\" style=\"height:300px\">\n",
+    "\n",
+    "Text generation should be terminated when either max length is reached or terminal symbol is generated.  \n",
+    "Explore several inference techniques:\n",
+    "1. [1 point] Argmax\n",
+    "1. [1 point] Beamsearch\n",
+    "1. [1 point] Sampling from probabilty distribution with temperature\n",
+    "1. [1 point] Nucleus sampling\n",
+    "1. [1 point] Top-k sampling\n",
+    "\n",
+    "\n",
+    "For every method you should provide implemented code and generated examples. Each example must contain at least 10 words (not subword tokens).\n",
+    "\n",
+    "Readings:\n",
+    "https://arxiv.org/abs/1904.09751"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "from string import ascii_letters\n",
+    "import re\n",
+    "from torchtext.datasets import WikiText2\n",
+    "from torchtext import data\n",
+    "from torchtext.vocab import Vocab"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import urllib.request, os, zipfile, tokenizers, dill, json\n",
+    "from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers, ByteLevelBPETokenizer\n",
+    "from tqdm import tqdm_notebook\n",
+    "from collections import Counter\n",
+    "\n",
+    "import torch as tt\n",
+    "import torch.nn as nn\n",
+    "import torch.optim as optim\n",
+    "import numpy as np\n",
+    "import pandas as pd"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "'./data/wikitext-2/wikitext-2'"
+      ]
+     },
+     "execution_count": 3,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "WikiText2.download(\"./data\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "with open(os.path.join(\".\", \"data\", \"wikitext-2\", \"wikitext-2\", \"wiki.test.tokens\"), \"r\") as test_f:\n",
+    "    test = test_f.read()\n",
+    "with open(os.path.join(\".\", \"data\", \"wikitext-2\", \"wikitext-2\", \"wiki.train.tokens\"), \"r\") as train_f:\n",
+    "    train = train_f.read()\n",
+    "with open(os.path.join(\".\", \"data\", \"wikitext-2\", \"wikitext-2\", \"wiki.valid.tokens\"), \"r\") as valid_f:\n",
+    "    valid = valid_f.read()  "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Препроцессинг\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "separators = [\"\\n\", \"\\t\", \".\", \"?\", \"!\"]\n",
+    "punct = [\",\", \":\", \";\"]\n",
+    "\n",
+    "def preprocess(input_text):\n",
+    "    result = \"\"\n",
+    "    input_text = re.sub(\"<unk>\", \"\", input_text)\n",
+    "    for i in input_text:\n",
+    "        if i in ascii_letters or i in separators:\n",
+    "            result += i\n",
+    "        elif i in punct:\n",
+    "            result += \",\"\n",
+    "        elif i == \" \":\n",
+    "            result += \" \"\n",
+    "    \n",
+    "    result = re.sub(\"\\s+\", \" \", result)\n",
+    "    result = re.sub(\"[\\n\\t\\.?!]\", \"<eos> <sos>\", result)\n",
+    "    result = re.sub(\"\\s+\", \" \", result)\n",
+    "    while re.search(\"<eos> <sos>\\s+<eos> <sos>\", result):\n",
+    "      result = re.sub(\"<eos> <sos>\\s+<eos> <sos>\", \"<eos> <sos>\", result)\n",
+    "      result = re.sub(\"\\s+\", \" \", result)\n",
+    "    result = re.sub(\"\\s+\", \" \", result)\n",
+    "    result = '<sos> ' + result\n",
+    "    idx = result.rfind(\"<sos>\")\n",
+    "    return result[:idx].lower()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "clean_train = preprocess(train)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "esigner honjou and composer hitoshi sakimoto both returned from previous entries , along with valkyria chronicles ii director takeshi ozawa <eos> <sos> a large team of writers handled the script <eos> <sos> the game s opening theme was sung by may n <eos> <sos> it met with positive sales in japan , and was praised by both japanese and western critics <eos> <sos> after release , it received downloadable content , along with an expanded edition in november of that year <eos> <sos> it was also adapted into manga and an original video animation series <eos> <sos> due to low sales of valkyria chronicles ii , valkyria chronicles iii was not localized , but a fan translation compatible with the game s expanded edition was released in <eos> <sos> media<eos> <sos>vision would return to the franchise with the development of valkyria , azure revolution for the playstation <eos> <sos> gameplay as with previous chronicles games , valkyria chronicles iii is a tactical role playing game where players\n"
+     ]
+    }
+   ],
+   "source": [
+    "print(clean_train[1000:2000])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "with open(os.path.join(\".\", \"data\", \"clean_train.tokens\"), \"w\", encoding=\"UTF-8\") as clean_fd:\n",
+    "    clean_fd.write(clean_train)\n",
+    "\n",
+    "with open(os.path.join(\".\", \"data\", \"clean_test.tokens\"), \"w\", encoding=\"UTF-8\") as clean_fd:\n",
+    "    clean_fd.write(preprocess(test))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from tokenizers import SentencePieceBPETokenizer"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_tokenizer = SentencePieceBPETokenizer()\n",
+    "train_tokenizer.add_special_tokens([\"<eos>\", \"<unk>\", \"<sos>\"])\n",
+    "train_tokenizer.train([os.path.join(\".\", \"data\", \"clean_train.tokens\"), os.path.join(\".\", \"data\", \"clean_test.tokens\")], vocab_size=20000)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "Tokenizer(vocabulary_size=20003, model=SentencePieceBPE, unk_token=<unk>, replacement=▁, add_prefix_space=True, dropout=None)"
+      ]
+     },
+     "execution_count": 11,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "train_tokenizer"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "0"
+      ]
+     },
+     "execution_count": 12,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "train_tokenizer.token_to_id(\"<eos>\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def tokenize(sent):\n",
+    "    sent = preprocess(sent)\n",
+    "    return train_tokenizer.encode(sent).tokens"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import torchtext\n",
+    "from torchtext.datasets import LanguageModelingDataset\n",
+    "\n",
+    "TXT = torchtext.data.Field(lower=True, include_lengths=False, batch_first=False, \n",
+    "                           tokenize=lambda sent: tokenize(sent))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train, val_data, test = WikiText2.splits(TXT)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "<torchtext.datasets.language_modeling.WikiText2 object at 0x128acdb10>\n"
+     ]
+    }
+   ],
+   "source": [
+    "print(train)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Обучаем Модель\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from torchtext.data import BPTTIterator\n",
+    "import torch as tt\n",
+    "\n",
+    "TXT.build_vocab(train, val_data, test, min_freq=5)\n",
+    "\n",
+    "train_iter, val_iter, test_iter = BPTTIterator.splits((train, val_data, test),\n",
+    "            batch_size=128, bptt_len=50, repeat=False, device=tt.device(\"cpu\"))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "batc = next(iter(train_iter))\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "['▁', '<eos>', '▁gods', '▁noise', '▁goat', '▁many', '▁be', '▁sought', '▁cleared', '▁seen', '▁would', '▁deemed', '▁music', '▁was', '▁the', '▁first', 'or', '<sos>', '<eos>', '▁at', '▁published', '▁in', '▁knights', '▁she', '▁sailors', '▁this', '▁crews', '▁part', '▁development', '<eos>', '▁their', '▁for', '<eos>', '<eos>', '▁revised', '▁important', '▁was', '▁play', '▁', '▁with', '▁boat', '<sos>', '▁hero', '▁village', '▁member', '▁caribbean', '▁which', '▁sum', '▁,', 'rae', '▁by', '<eos>', '<sos>', '▁become', '▁', '<sos>', '▁,', '▁heir', '▁latter', '▁,', '▁and', '▁successive', '▁a', '▁', '▁on', '▁nasty', '▁professional', '▁write', '▁john', '<eos>', '▁an', '▁her', '▁channel', '▁active', '▁in', '▁', '▁,', 'ayan', '▁sorraia', '▁against', '▁north', 'c', '▁and', '▁allowed', '▁lead', '▁inc', '▁vineyards', '▁the', '▁,', '▁', '▁s', '<eos>', '▁,', '▁to', '<sos>', '▁to', '▁female', '▁in', '<sos>', '▁', '▁heavy', '▁a', '▁describing', 'ode', '▁incendiary', '▁and', '▁r', '▁that', '▁,', '<sos>', '▁the', '▁hill', '▁dance', '▁are', '▁into', '▁', '<eos>', '▁ace', '▁part', '▁they', '▁size', '▁fez', '▁simultaneous', '▁,', '▁left', '▁from', '▁along', '▁death']\n",
+      "['<eos>', '▁', '▁were', '▁is', '▁s', '▁male', '▁the', '▁to', '▁', '▁by', '▁include', '▁insufficient', '▁videos', '▁noted', '▁female', '▁national', '▁', '▁it', '▁', '▁a', '▁in', '▁,', '▁most', '▁received', '▁', '▁church', '▁were', '▁of', '▁of', '▁', '▁jobs', '▁a', '▁', '<sos>', '▁their', '▁producer', '▁already', '▁was', '<sos>', '▁mac', '▁be', '▁the', '▁sp', '▁has', '▁of', '▁rhythms', '▁norton', '▁in', '▁it', '▁,', '▁the', '▁', '▁it', '▁archdeacon', '<eos>', '▁', '▁,', 's', '▁highway', '▁with', '▁team', '▁lines', '▁pictish', '<sos>', '▁september', '▁', '▁footballer', '▁that', '▁who', '▁', '▁independent', '▁second', '▁television', '▁c', '▁,', '▁credits', '▁rarely', 'agara', '▁has', '▁rub', '▁,', 'ars', '▁did', '▁all', '▁singer', '<eos>', '▁that', '▁provinces', '▁they', '<eos>', '▁best', '<sos>', '▁keamy', '▁him', '▁according', '▁judo', '▁population', '▁contrast', '▁', '<eos>', '▁machinery', '▁government', '▁it', '▁stein', '▁gunpowder', '▁was', 'ko', '▁exists', '▁which', '▁south', '▁united', '▁is', '▁,', '▁not', '▁the', '<eos>', '▁', '▁attorney', '▁of', '▁could', '▁,', '▁as', '▁filming', '▁the', '▁wing', '▁around', '▁a', '▁certificate']\n"
+     ]
+    }
+   ],
+   "source": [
+    "def recover_text(vector):\n",
+    "    return [TXT.vocab.itos[v] for v in vector[0]]\n",
+    "\n",
+    "print(recover_text(batc.text.data.squeeze()))\n",
+    "\n",
+    "print(recover_text(batc.target.data.squeeze()))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "tensor([[   2,    4, 1192,  ...,   22,  145,  273],\n",
+       "        [   4,    2,   26,  ...,  148,   11, 9073],\n",
+       "        [   2,    4, 3273,  ...,    3,   98,    5],\n",
+       "        ...,\n",
+       "        [   8,    4,    3,  ..., 6916,    6,   25],\n",
+       "        [ 936,    2, 1192,  ..., 2393,    2, 1570],\n",
+       "        [   4,    4,    9,  ..., 2588,    3,   12]])"
+      ]
+     },
+     "execution_count": 20,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "batc.text"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "tensor([[   4,    2,   26,  ...,  148,   11, 9073],\n",
+       "        [   2,    4, 3273,  ...,    3,   98,    5],\n",
+       "        [   4,    2,   18,  ...,  100,    7, 1575],\n",
+       "        ...,\n",
+       "        [ 936,    2, 1192,  ..., 2393,    2, 1570],\n",
+       "        [   4,    4,    9,  ..., 2588,    3,   12],\n",
+       "        [   2,    2,  212,  ..., 5296,  175,   68]])"
+      ]
+     },
+     "execution_count": 21,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "batc.target"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 22,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import torch.nn as nn\n",
+    "import torch as tt\n",
+    "\n",
+    "class Autogressive_RNN(nn.Module):\n",
+    "    \n",
+    "    def __init__(self, vocab_size, embed_size, hidden_size):\n",
+    "        super(Autogressive_RNN, self).__init__()\n",
+    "        self.embedding = nn.Embedding(vocab_size, embed_size)\n",
+    "        \n",
+    "        self.rnn = nn.LSTM(input_size=embed_size,\n",
+    "                           hidden_size=hidden_size,\n",
+    "                           bidirectional=True,\n",
+    "                           batch_first=True,\n",
+    "                          )\n",
+    "        \n",
+    "        self.fc = nn.Linear(hidden_size * 2, vocab_size)\n",
+    "        \n",
+    "        self.init_weights()\n",
+    "        \n",
+    "    def init_weights(self):\n",
+    "        nn.init.uniform_(self.embedding.weight)\n",
+    "        nn.init.xavier_uniform_(self.fc.weight)\n",
+    "        nn.init.zeros_(self.fc.bias)\n",
+    "        \n",
+    "    def forward(self, batch):\n",
+    "        \n",
+    "        x = batch.text.T if hasattr(batch, \"text\") else batch\n",
+    "        x = self.embedding(x)  \n",
+    "        x, _ = self.rnn(x)\n",
+    "        x = self.fc(x)\n",
+    "        return x.transpose(1,2)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import torch.optim as optim\n",
+    "\n",
+    "model = Autogressive_RNN(len(TXT.vocab.itos),\n",
+    "                embed_size=100,\n",
+    "                hidden_size=128,\n",
+    "               )\n",
+    "\n",
+    "optimizer = optim.Adam(model.parameters())\n",
+    "scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5)\n",
+    "criterion = nn.CrossEntropyLoss(ignore_index=0)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 24,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import numpy as np\n",
+    "\n",
+    "def _train_epoch(model, iterator, optimizer, criterion, curr_epoch):\n",
+    "\n",
+    "    model.train()\n",
+    "\n",
+    "    running_loss = 0\n",
+    "\n",
+    "    n_batches = len(iterator)\n",
+    "    iterator = tqdm_notebook(iterator, total=n_batches, desc='epoch %d' % (curr_epoch), leave=True)\n",
+    "\n",
+    "    for i, batch in enumerate(iterator):\n",
+    "        optimizer.zero_grad()\n",
+    "\n",
+    "        pred = model(batch)\n",
+    "      \n",
+    "        loss = criterion(pred, batch.target.T)\n",
+    "        loss.backward()\n",
+    "        optimizer.step()\n",
+    "\n",
+    "        curr_loss = loss.data.cpu().detach().item()\n",
+    "        \n",
+    "        loss_smoothing = i / (i + 1)\n",
+    "        running_loss = loss_smoothing * running_loss + (1 - loss_smoothing) * curr_loss\n",
+    "\n",
+    "        iterator.set_postfix(loss='%.5f' % running_loss)\n",
+    "\n",
+    "    return running_loss"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 25,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def _test_epoch(model, iterator, criterion):\n",
+    "    model.eval()\n",
+    "    epoch_loss = 0\n",
+    "\n",
+    "    n_batches = len(iterator)\n",
+    "    with tt.no_grad():\n",
+    "        for batch in iterator:\n",
+    "            pred = model(batch)\n",
+    "            loss = criterion(pred, batch.target.T)\n",
+    "            epoch_loss += loss.data.item()\n",
+    "\n",
+    "    return epoch_loss / n_batches"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 26,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def nn_train(model, train_iterator, valid_iterator, criterion, optimizer, n_epochs=100,\n",
+    "          scheduler=None, early_stopping=0):\n",
+    "  \n",
+    "    model = model.cpu()\n",
+    "    criterion = criterion.cpu()\n",
+    "\n",
+    "    prev_loss = 100500\n",
+    "    es_epochs = 0\n",
+    "    best_epoch = None\n",
+    "    history = pd.DataFrame()\n",
+    "\n",
+    "    for epoch in range(n_epochs):\n",
+    "        train_loss = _train_epoch(model, train_iterator, optimizer, criterion, epoch)\n",
+    "        valid_loss = _test_epoch(model, valid_iterator, criterion)\n",
+    "\n",
+    "        valid_loss = valid_loss\n",
+    "        print('epoch %d, validation loss %.5f' % (epoch, valid_loss))\n",
+    "        record = {'epoch': epoch, 'train_loss': train_loss, 'valid_loss': valid_loss}\n",
+    "        history = history.append(record, ignore_index=True)\n",
+    "\n",
+    "        if early_stopping > 0:\n",
+    "            if valid_loss > prev_loss:\n",
+    "                es_epochs += 1\n",
+    "            else:\n",
+    "                es_epochs = 0\n",
+    "\n",
+    "            if es_epochs >= early_stopping:\n",
+    "                best_epoch = history[history.valid_loss == history.valid_loss.min()].iloc[0]\n",
+    "                print('Early stopping! best epoch: %d val %.5f' % (best_epoch['epoch'], best_epoch['valid_loss']))\n",
+    "                break\n",
+    "\n",
+    "            prev_loss = min(prev_loss, valid_loss)\n",
+    "    return history"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 27,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "b22d22e726e346acbc65b3a088e6aa02",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "HBox(children=(IntProgress(value=0, description='epoch 0', max=345, style=ProgressStyle(description_width='ini…"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "epoch 0, validation loss 4.90298\n"
+     ]
+    },
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "1c4486a872314988a6f9c1bd6cf29c8a",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "HBox(children=(IntProgress(value=0, description='epoch 1', max=345, style=ProgressStyle(description_width='ini…"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "epoch 1, validation loss 3.84800\n"
+     ]
+    },
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "3951663e0bbc4fab9b44cd315cc89dd5",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "HBox(children=(IntProgress(value=0, description='epoch 2', max=345, style=ProgressStyle(description_width='ini…"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "epoch 2, validation loss 3.15345\n"
+     ]
+    },
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "81a95c5ab6984f2bb952e770dfbe847f",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "HBox(children=(IntProgress(value=0, description='epoch 3', max=345, style=ProgressStyle(description_width='ini…"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "epoch 3, validation loss 2.59915\n"
+     ]
+    },
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "2993020d4ab74fa0b3686439c6602045",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "HBox(children=(IntProgress(value=0, description='epoch 4', max=345, style=ProgressStyle(description_width='ini…"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "epoch 4, validation loss 2.11169\n"
+     ]
+    }
+   ],
+   "source": [
+    "import pandas as pd\n",
+    "from tqdm import tqdm_notebook\n",
+    "\n",
+    "history = nn_train(model, train_iter, val_iter, criterion, optimizer, scheduler=scheduler, \n",
+    "        n_epochs=5, early_stopping=2)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## График"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 28,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>epoch</th>\n",
+       "      <th>train_loss</th>\n",
+       "      <th>valid_loss</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <td>0</td>\n",
+       "      <td>0.0</td>\n",
+       "      <td>6.080016</td>\n",
+       "      <td>4.902978</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>1</td>\n",
+       "      <td>1.0</td>\n",
+       "      <td>4.478063</td>\n",
+       "      <td>3.847999</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>2</td>\n",
+       "      <td>2.0</td>\n",
+       "      <td>3.625603</td>\n",
+       "      <td>3.153449</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>3</td>\n",
+       "      <td>3.0</td>\n",
+       "      <td>2.987568</td>\n",
+       "      <td>2.599154</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>4</td>\n",
+       "      <td>4.0</td>\n",
+       "      <td>2.442143</td>\n",
+       "      <td>2.111691</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "   epoch  train_loss  valid_loss\n",
+       "0    0.0    6.080016    4.902978\n",
+       "1    1.0    4.478063    3.847999\n",
+       "2    2.0    3.625603    3.153449\n",
+       "3    3.0    2.987568    2.599154\n",
+       "4    4.0    2.442143    2.111691"
+      ]
+     },
+     "execution_count": 28,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "history.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 29,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "[6.080016495524971,\n",
+       " 4.478062941371528,\n",
+       " 3.6256034609200274,\n",
+       " 2.987567922343379,\n",
+       " 2.4421434471572643]"
+      ]
+     },
+     "execution_count": 29,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "list(history[\"train_loss\"])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import matplotlib.pyplot as plt\n",
+    "plt.figure(figsize=(14, 10))\n",
+    "plt.plot(list(history[\"train_loss\"]))\n",
+    "plt.legend(('Train', 'Validation'))\n",
+    "plt.title('Training process', fontsize=20)\n",
+    "plt.xlabel('Iterations', fontsize=16)\n",
+    "plt.ylabel('Loss function', fontsize=16)\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "model = model.cpu()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def recover_text(vector):\n",
+    "    return [train_tokenizer.id_to_token(idx) for idx in vector]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def predict(model, func):\n",
+    "    seq_max_len = 80\n",
+    "    with tt.no_grad():\n",
+    "        current_token = train_tokenizer.token_to_id(\"<sos>\")\n",
+    "        seq = [current_token]\n",
+    "        seq_len = 0\n",
+    "        while seq_len < seq_max_len and current_token != train_tokenizer.token_to_id(\"<eos>\"):\n",
+    "            pred = model(tt.tensor([seq]))[:,:,-1]\n",
+    "            current_token = func(pred)\n",
+    "            seq.append(current_token)\n",
+    "            seq_len += 1\n",
+    "    return seq"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Argmax"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "argmax = lambda prob: tt.argmax(pred).item()\n",
+    "\n",
+    "out = predict(model, argmax)\n",
+    "print(recover_text(out))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Sampling from probabilty distribution with temperature"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def temperature_function(pred):\n",
+    "    temp = 1\n",
+    "    tau_logits = tt.exp(pred / temp) / tt.sum(tt.exp(pred / temp))\n",
+    "    probs = tau_logits.squeeze().numpy() / np.sum(tau_logits.squeeze().numpy())\n",
+    "    return np.random.choice(len(probs), 1, p=probs)[0]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "F.softmax(logits, dim=0).numpy()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "out = predict(model, temperature_function)\n",
+    "print(recover_text(out))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Nucleus sampling"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import torch.nn.functional as F\n",
+    "from copy import deepcopy\n",
+    "from warnings import filterwarnings\n",
+    "\n",
+    "filterwarnings(\"ignore\")\n",
+    "\n",
+    "def nucleus_sapmling(pred):\n",
+    "    top_p = 0.9\n",
+    "    sorted_logits, sorted_indices = tt.sort(pred, descending=True)\n",
+    "    cumulative_probs = tt.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)\n",
+    "\n",
+    "    sorted_indices_to_remove = deepcopy(cumulative_probs)\n",
+    "    for idx in range(len(sorted_indices_to_remove)):\n",
+    "      for sub_idx in range(len(sorted_indices_to_remove[idx])):\n",
+    "        sorted_indices_to_remove[idx][sub_idx] = 1 if sorted_indices_to_remove[idx][sub_idx] >= top_p else 0\n",
+    "        sorted_indices_to_remove[idx][sub_idx] = int(sorted_indices_to_remove[idx][sub_idx])\n",
+    "    sorted_indices_to_remove = tt.tensor(sorted_indices_to_remove, dtype=tt.uint8)\n",
+    "\n",
+    "    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()\n",
+    "    sorted_indices_to_remove[..., 0] = 0\n",
+    "\n",
+    "    indices_to_remove = tt.zeros_like(pred, dtype=tt.uint8).scatter_(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)\n",
+    "    pred[indices_to_remove] = -float('Inf')\n",
+    "\n",
+    "    probs = F.softmax(pred, dim=-1)\n",
+    "    prev = tt.multinomial(probs, num_samples=1)\n",
+    "    return prev"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "out = predict(model, nucleus_sapmling)\n",
+    "print(recover_text(out))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Top-k sampling"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def top_k_sampling(pred):\n",
+    "    top_k = 6000\n",
+    "    top_k = min(top_k, pred.size(-1))  \n",
+    "    indices_to_remove = pred < tt.topk(pred, top_k)[0][..., -1, None]\n",
+    "    pred[indices_to_remove] = -float('Inf')\n",
+    "    probs = F.softmax(pred, dim=-1)\n",
+    "    prev = tt.multinomial(probs, num_samples=1)\n",
+    "    return prev"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "out = predict(model, top_k_sampling)\n",
+    "print(recover_text(out))"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.7.4"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
